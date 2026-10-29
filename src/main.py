@@ -1,142 +1,277 @@
-
 from pathlib import Path
-from collections import defaultdict, deque
+from collections import defaultdict
 from datetime import datetime
 import csv
 import cv2
 from ultralytics import YOLO
 
-# ================= CONFIGURATION =================
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-VIDEO_PATH = BASE_DIR / "videos" / "input7.mp4"
+VIDEO_PATH = BASE_DIR / "videos" / "input.mp4"
 OUTPUT_PATH = BASE_DIR / "output" / "counted_video.mp4"
 CSV_PATH = BASE_DIR / "output" / "vehicle_report.csv"
 EVENTS_PATH = BASE_DIR / "output" / "vehicle_events.csv"
 
 MODEL_NAME = "yolo11n.pt"
 
-CONFIDENCE = 0.35
-IMAGE_SIZE = 640
+CONFIDENCE = 0.25
+IMAGE_SIZE = 960
+IOU_THRESHOLD = 0.5
 
+# Horizontal counting line.
 LINE_Y = 0.75
+
+# Vertical divider between the two roads.
 ROAD_SPLIT_X = 0.50
+
+# Vehicles close to the divider are treated as ambiguous.
+DIVIDER_MARGIN = 0.025
+
+# Preview window dimensions.
+PREVIEW_WIDTH = 1280
+PREVIEW_HEIGHT = 800
+
+# Allow a vehicle to disappear briefly between observations.
+MAX_CROSSING_GAP = 30
 
 VEHICLE_CLASSES = {
     2: "Car",
     3: "Motorcycle",
     5: "Bus",
-    7: "Truck"
+    7: "Truck",
 }
-PREVIEW_WIDTH = 1000
-PREVIEW_HEIGHT = 650
-# =================================================
+
+# OpenCV uses BGR color order.
+BLUE = (255, 0, 0)
+RED = (0, 0, 255)
+YELLOW = (0, 255, 255)
+GREEN = (0, 255, 0)
+WHITE = (255, 255, 255)
+CYAN = (255, 255, 0)
+
+
+# ============================================================
+# 2. PREPARE OUTPUT FILES
+# ============================================================
 
 OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-print("Loading YOLO model...")
+if not VIDEO_PATH.exists():
+    raise FileNotFoundError(
+        f"Input video not found:\n{VIDEO_PATH}"
+    )
+
+print("=" * 60)
+print("YOLO VEHICLE COUNTER - HIGHWAY MODE")
+print("=" * 60)
+
+print("\nLoading YOLO model...")
+
 model = YOLO(MODEL_NAME)
+
+print("YOLO model loaded successfully.")
+
+
+# ============================================================
+# 3. OPEN VIDEO
+# ============================================================
 
 cap = cv2.VideoCapture(str(VIDEO_PATH))
 
 if not cap.isOpened():
-    raise FileNotFoundError(f"Cannot open video: {VIDEO_PATH}")
+    raise RuntimeError(
+        f"Could not open video:\n{VIDEO_PATH}"
+    )
 
 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
 fps = cap.get(cv2.CAP_PROP_FPS)
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
 if fps <= 0:
     fps = 30.0
 
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+if width <= 0 or height <= 0:
+    cap.release()
+    raise RuntimeError("The video has invalid dimensions.")
+
+line_y = int(height * LINE_Y)
+split_x = int(width * ROAD_SPLIT_X)
 
 writer = cv2.VideoWriter(
     str(OUTPUT_PATH),
     cv2.VideoWriter_fourcc(*"mp4v"),
     fps,
-    (width, height)
+    (width, height),
 )
 
 if not writer.isOpened():
     cap.release()
-    raise RuntimeError("Could not create output video.")
+    raise RuntimeError(
+        f"Could not create output video:\n{OUTPUT_PATH}"
+    )
 
-line_y = int(height * LINE_Y)
-split_x = int(width * ROAD_SPLIT_X)
+print(f"Video resolution: {width} x {height}")
+print(f"Video FPS: {fps:.2f}")
+print(f"Total frames: {total_frames}")
+print(f"Counting line Y: {line_y}")
+print(f"Road divider X: {split_x}")
 
-# ================= TRACKING DATA =================
 
-position_history = defaultdict(lambda: deque(maxlen=8))
+# ============================================================
+# 4. TRACKING AND COUNTING VARIABLES
+# ============================================================
+
+# Remember the previous side of the counting line for each ID.
+# -1 = above the line
+#  1 = on or below the line
+
+last_line_side = {}
+
+# Remember the frame in which the vehicle was last observed.
+last_seen_frame = {}
+
+# Remember the lane assigned when the vehicle was first seen.
+vehicle_lanes = {}
+
+# Prevent the same tracking ID from being counted repeatedly.
 counted_ids = set()
 
+# Remember the direction assigned to counted vehicles.
+vehicle_directions = {}
+
+# Counts by vehicle type.
 incoming_counts = defaultdict(int)
 outgoing_counts = defaultdict(int)
 
 incoming_total = 0
 outgoing_total = 0
 
-# Records for Phase 9
+# Event report.
 vehicle_events = []
 
 frame_number = 0
 
-# ================= DASHBOARD FUNCTION =================
 
-def draw_dashboard(frame, incoming_counts, outgoing_counts, frame_number):
-    """Draw a professional vehicle analytics dashboard."""
+# ============================================================
+# 5. DASHBOARD
+# ============================================================
 
-    incoming_total = sum(incoming_counts.values())
-    outgoing_total = sum(outgoing_counts.values())
-    total = incoming_total + outgoing_total
+def draw_dashboard(frame, incoming_counts, outgoing_counts):
+
+    frame_h, frame_w = frame.shape[:2]
+
+    scale = min(frame_w / 1000, frame_h / 600)
+
+    panel_width = min(
+        int(370 * scale),
+        frame_w - 20,
+    )
+
+    panel_height = min(
+        int(300 * scale),
+        frame_h - 20,
+    )
 
     overlay = frame.copy()
-
-    panel_width = min(390, frame.shape[1] - 20)
-    panel_height = min(320, frame.shape[0] - 20)
 
     cv2.rectangle(
         overlay,
         (10, 10),
         (10 + panel_width, 10 + panel_height),
         (20, 20, 20),
-        -1
+        -1,
     )
 
-    cv2.addWeighted(overlay, 0.82, frame, 0.18, 0, frame)
+    cv2.addWeighted(
+        overlay,
+        0.82,
+        frame,
+        0.18,
+        0,
+        frame,
+    )
 
-    def put_text(text, x, y, scale=0.65, color=(255, 255, 255)):
+    def put_text(
+        text,
+        x,
+        y,
+        font_scale=0.65,
+        color=WHITE,
+        thickness=2,
+    ):
         cv2.putText(
             frame,
             text,
-            (x, y),
+            (int(x * scale), int(y * scale)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            scale,
+            font_scale * scale,
             color,
-            2,
-            cv2.LINE_AA
+            max(1, int(thickness * scale)),
+            cv2.LINE_AA,
         )
 
-    put_text("VEHICLE ANALYTICS", 25, 40, 0.75)
-    put_text(f"Incoming: {incoming_total}", 25, 78, 0.68, (0, 255, 0))
-    put_text(f"Outgoing: {outgoing_total}", 25, 113, 0.68, (0, 165, 255))
-    put_text(f"Total: {total}", 25, 148, 0.68)
+    incoming = sum(incoming_counts.values())
+    outgoing = sum(outgoing_counts.values())
 
-    put_text("VEHICLE BREAKDOWN", 25, 185, 0.55, (255, 255, 0))
+    put_text(
+        "VEHICLE ANALYTICS",
+        20,
+        40,
+        0.85,
+    )
 
-    y = 215
+    put_text(
+        f"Incoming: {incoming}",
+        20,
+        80,
+        0.75,
+        BLUE,
+    )
 
-    for vehicle in ["Car", "Motorcycle", "Bus", "Truck"]:
-        incoming = incoming_counts.get(vehicle, 0)
-        outgoing = outgoing_counts.get(vehicle, 0)
+    put_text(
+        f"Outgoing: {outgoing}",
+        20,
+        118,
+        0.75,
+        RED,
+    )
+
+    put_text(
+        f"Total Vehicles: {incoming + outgoing}",
+        20,
+        155,
+        0.70,
+    )
+
+    put_text(
+        "VEHICLE BREAKDOWN",
+        20,
+        192,
+        0.60,
+        CYAN,
+    )
+
+    y = 222
+
+    for name in ["Car", "Motorcycle", "Bus", "Truck"]:
+
+        count_in = incoming_counts.get(name, 0)
+        count_out = outgoing_counts.get(name, 0)
 
         put_text(
-            f"{vehicle}: IN {incoming} | OUT {outgoing}",
-            25,
+            f"{name}: IN {count_in} | OUT {count_out}",
+            20,
             y,
-            0.48,
-            (220, 220, 220)
+            0.53,
+            (235, 235, 235),
+            1,
         )
 
         y += 25
@@ -144,20 +279,86 @@ def draw_dashboard(frame, incoming_counts, outgoing_counts, frame_number):
     return frame
 
 
-# ================= MAIN PROCESSING LOOP =================
+# ============================================================
+# 6. COUNT A VEHICLE
+# ============================================================
 
-print("Phase 8: Live dashboard enabled.")
-print("Phase 9: Vehicle event logging enabled.")
-print("Press Q in the video window to stop processing.")
+def record_vehicle(
+    track_id,
+    vehicle_name,
+    direction,
+    frame_number,
+):
+    global incoming_total, outgoing_total
+
+    # This function should only be called for uncounted IDs.
+    if track_id in counted_ids:
+        return
+
+    counted_ids.add(track_id)
+    vehicle_directions[track_id] = direction
+
+    if direction == "INCOMING":
+
+        incoming_counts[vehicle_name] += 1
+        incoming_total += 1
+
+    elif direction == "OUTGOING":
+
+        outgoing_counts[vehicle_name] += 1
+        outgoing_total += 1
+
+    event = {
+        "Vehicle_ID": int(track_id),
+        "Vehicle_Type": vehicle_name,
+        "Direction": direction,
+        "Frame_Number": frame_number,
+        "Video_Time_Seconds": round(
+            frame_number / fps,
+            2,
+        ),
+        "Timestamp": datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    }
+
+    vehicle_events.append(event)
+
+    print(
+        f"[COUNTED] ID={track_id} | "
+        f"Type={vehicle_name} | "
+        f"Direction={direction} | "
+        f"Incoming={incoming_total} | "
+        f"Outgoing={outgoing_total}"
+    )
+
+
+# ============================================================
+# 7. MAIN PROCESSING LOOP
+# ============================================================
+
+print("\nStarting video processing...")
+print("LEFT ROAD: Incoming vehicles (BLUE)")
+print("RIGHT ROAD: Outgoing vehicles (RED)")
+print("DIVIDER AREA: Yellow")
+print("Incoming direction: DOWNWARD")
+print("Outgoing direction: UPWARD")
+print("Press Q to stop processing.\n")
 
 try:
+
     while True:
+
         success, frame = cap.read()
 
         if not success:
             break
 
         frame_number += 1
+
+        # ----------------------------------------------------
+        # DETECT AND TRACK VEHICLES
+        # ----------------------------------------------------
 
         results = model.track(
             frame,
@@ -166,267 +367,468 @@ try:
             conf=CONFIDENCE,
             imgsz=IMAGE_SIZE,
             classes=list(VEHICLE_CLASSES.keys()),
-            verbose=False
+            verbose=False,
+            iou=IOU_THRESHOLD,
         )
 
-        # Draw counting lines and road divider
+        # ----------------------------------------------------
+        # DRAW COUNTING LINE AND ROAD DIVIDER
+        # ----------------------------------------------------
+
+        # Left half of the horizontal counting line.
         cv2.line(
             frame,
             (0, line_y),
             (split_x, line_y),
-            (0, 255, 0),
-            3
+            GREEN,
+            3,
         )
 
+        # Right half of the horizontal counting line.
         cv2.line(
             frame,
             (split_x, line_y),
             (width - 1, line_y),
             (0, 165, 255),
-            3
+            3,
         )
 
+        # Vertical divider between the traffic directions.
         cv2.line(
             frame,
             (split_x, 0),
             (split_x, height - 1),
-            (255, 255, 255),
-            2
+            WHITE,
+            2,
         )
 
-        # ================= DETECTION =================
+        # ----------------------------------------------------
+        # PROCESS TRACKED VEHICLES
+        # ----------------------------------------------------
 
-        if results and results[0].boxes.id is not None:
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            class_ids = results[0].boxes.cls.cpu().numpy().astype(int)
-            track_ids = results[0].boxes.id.cpu().numpy().astype(int)
+        if (
+            results
+            and results[0].boxes is not None
+            and results[0].boxes.id is not None
+        ):
+
+            boxes = (
+                results[0]
+                .boxes.xyxy
+                .cpu()
+                .numpy()
+            )
+
+            class_ids = (
+                results[0]
+                .boxes.cls
+                .cpu()
+                .numpy()
+                .astype(int)
+            )
+
+            track_ids = (
+                results[0]
+                .boxes.id
+                .cpu()
+                .numpy()
+                .astype(int)
+            )
 
             for box, class_id, track_id in zip(
-                boxes, class_ids, track_ids
+                boxes,
+                class_ids,
+                track_ids,
             ):
+
                 x1, y1, x2, y2 = map(int, box)
 
-                vehicle_name = VEHICLE_CLASSES.get(class_id, "Vehicle")
+                vehicle_name = VEHICLE_CLASSES.get(
+                    class_id,
+                    "Vehicle",
+                )
 
                 center_x = (x1 + x2) // 2
                 bottom_y = y2
 
-                history = position_history[track_id]
+                # ------------------------------------------------
+                # IDENTIFY THE VEHICLE'S LANE
+                # ------------------------------------------------
 
-                previous_y = history[-1][1] if history else None
+                # Keep the initial lane assignment for this ID.
+                # Do not let small bounding-box movements around
+                # the divider repeatedly change the lane.
 
-                history.append((center_x, bottom_y))
+                if track_id not in vehicle_lanes:
 
-                direction = "Tracking"
+                    if center_x < split_x:
+                        vehicle_lanes[track_id] = "LEFT"
+                    else:
+                        vehicle_lanes[track_id] = "RIGHT"
 
-                # Estimate vertical movement
-                if len(history) >= 3:
-                    movement = history[-1][1] - history[-3][1]
+                lane = vehicle_lanes[track_id]
 
-                    if movement > 5:
-                        direction = "Down"
-                    elif movement < -5:
-                        direction = "Up"
+                # ------------------------------------------------
+                # DETERMINE THE CURRENT SIDE OF THE LINE
+                # ------------------------------------------------
 
-                # Detect crossing of counting line
-                if previous_y is not None and track_id not in counted_ids:
+                current_side = (
+                    -1 if bottom_y < line_y else 1
+                )
 
-                    crossed_line = (
-                        previous_y < line_y <= bottom_y
-                        or previous_y > line_y >= bottom_y
+                previous_side = last_line_side.get(
+                    track_id
+                )
+
+                previous_frame = last_seen_frame.get(
+                    track_id
+                )
+
+                # ------------------------------------------------
+                # COUNT A CROSSING
+                # ------------------------------------------------
+
+                if previous_side is not None:
+
+                    frame_gap = (
+                        frame_number - previous_frame
+                        if previous_frame is not None
+                        else MAX_CROSSING_GAP + 1
                     )
 
-                    if crossed_line and bottom_y != previous_y:
+                    crossed_line = (
+                        previous_side != current_side
+                        and 0 < frame_gap <= MAX_CROSSING_GAP
+                    )
 
-                        if bottom_y > previous_y:
+                    if (
+                        crossed_line
+                        and track_id not in counted_ids
+                    ):
+
+                        event_direction = None
+
+                        # Downward crossing = incoming.
+                        if (
+                            previous_side == -1
+                            and current_side == 1
+                        ):
                             event_direction = "INCOMING"
 
-                            incoming_total += 1
-                            incoming_counts[vehicle_name] += 1
-
-                        else:
+                        # Upward crossing = outgoing.
+                        elif (
+                            previous_side == 1
+                            and current_side == -1
+                        ):
                             event_direction = "OUTGOING"
 
-                            outgoing_total += 1
-                            outgoing_counts[vehicle_name] += 1
+                        if event_direction is not None:
 
-                        counted_ids.add(track_id)
-                        direction = event_direction
-
-                        # Record event timestamp and vehicle details
-                        video_seconds = frame_number / fps
-
-                        event = {
-                            "Vehicle_ID": track_id,
-                            "Vehicle_Type": vehicle_name,
-                            "Direction": event_direction,
-                            "Frame_Number": frame_number,
-                            "Video_Time": round(video_seconds, 2),
-                            "Timestamp": datetime.now().strftime(
-                                "%Y-%m-%d %H:%M:%S"
+                            record_vehicle(
+                                track_id=track_id,
+                                vehicle_name=vehicle_name,
+                                direction=event_direction,
+                                frame_number=frame_number,
                             )
-                        }
 
-                        vehicle_events.append(event)
+                # Update the previous observation after checking
+                # whether a crossing occurred.
+                last_line_side[track_id] = current_side
+                last_seen_frame[track_id] = frame_number
 
-                # Detection colors
-                if direction == "INCOMING":
-                    color = (0, 255, 0)
-                elif direction == "OUTGOING":
-                    color = (0, 165, 255)
+                # ------------------------------------------------
+                # ASSIGN BOX COLOR
+                # ------------------------------------------------
+
+                if track_id in counted_ids:
+
+                    # Counted vehicles retain their counted color.
+                    direction = vehicle_directions[track_id]
+
+                    if direction == "INCOMING":
+                        color = BLUE
+                    else:
+                        color = RED
+
+                    label = (
+                        f"{vehicle_name} ID:{track_id} "
+                        f"{direction}"
+                    )
+
                 else:
-                    color = (255, 255, 0)
+
+                    # Color vehicles immediately using the road.
+                    # This does not wait for the counting line.
+                    divider_margin = int(
+                        width * DIVIDER_MARGIN
+                    )
+
+                    if abs(center_x - split_x) <= divider_margin:
+
+                        color = YELLOW
+                        label = (
+                            f"{vehicle_name} ID:{track_id} "
+                            "TRACKING"
+                        )
+
+                    elif lane == "LEFT":
+
+                        color = YELLOW
+
+                        label = (
+                            f"{vehicle_name} ID:{track_id} "
+                            "OUTGOING"
+                        )
+
+                    else:
+
+                        color = YELLOW
+
+                        label = (
+                            f"{vehicle_name} ID:{track_id} "
+                            "INCOMING"
+                        )
+
+                # ------------------------------------------------
+                # DRAW BOUNDING BOX
+                # ------------------------------------------------
 
                 cv2.rectangle(
                     frame,
                     (x1, y1),
                     (x2, y2),
                     color,
-                    2
+                    2,
                 )
 
-                label = f"{vehicle_name} ID:{track_id} {direction}"
+                text_y = max(y1 - 10, 20)
 
                 cv2.putText(
                     frame,
                     label,
-                    (x1, max(y1 - 10, 20)),
+                    (x1, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
+                    0.55,
                     color,
-                    2
+                    2,
+                    cv2.LINE_AA,
                 )
 
-        # ================= LIVE DASHBOARD =================
+        # ----------------------------------------------------
+        # DRAW PROGRESS
+        # ----------------------------------------------------
 
-        frame = draw_dashboard(
-            frame,
-            incoming_counts,
-            outgoing_counts,
-            frame_number
-        )
+        if total_frames > 0:
 
-        # Show processing progress
-        progress = (
-            frame_number / total_frames * 100
-            if total_frames > 0 else 0
-        )
+            progress = (
+                frame_number / total_frames
+            ) * 100
+
+        else:
+
+            progress = 0.0
+
+        progress_text = f"Progress: {progress:.1f}%"
 
         cv2.putText(
             frame,
-            f"Progress: {progress:.1f}%",
+            progress_text,
             (15, height - 20),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2
+            0.65,
+            WHITE,
+            2,
+            cv2.LINE_AA,
         )
 
-        # Save and display frame
-# Save the original, full-resolution frame without cropping
+        # ----------------------------------------------------
+        # SAVE ANNOTATED VIDEO
+        # ----------------------------------------------------
 
-        # Save the original, full-resolution frame without cropping
-        writer.write(frame)
+        output_frame = draw_dashboard(
+            frame.copy(),
+            incoming_counts,
+            outgoing_counts,
+        )
 
-        # Create a smaller preview while preserving the complete video
+        writer.write(output_frame)
+
+        # ----------------------------------------------------
+        # SHOW LIVE PREVIEW
+        # ----------------------------------------------------
+
         preview_scale = min(
             PREVIEW_WIDTH / width,
             PREVIEW_HEIGHT / height,
-            1.0
+            1.0,
         )
 
-        preview_width = int(width * preview_scale)
-        preview_height = int(height * preview_scale)
+        preview_width = max(
+            1,
+            int(width * preview_scale),
+        )
+
+        preview_height = max(
+            1,
+            int(height * preview_scale),
+        )
 
         preview_frame = cv2.resize(
             frame,
             (preview_width, preview_height),
-            interpolation=cv2.INTER_AREA
+            interpolation=cv2.INTER_AREA,
         )
 
-        cv2.imshow("YOLO Vehicle Counter - Full Video", preview_frame)
+        preview_frame = draw_dashboard(
+            preview_frame,
+            incoming_counts,
+            outgoing_counts,
+        )
+
+        preview_progress = (
+            f"Progress: {progress:.1f}%"
+        )
+
+        cv2.putText(
+            preview_frame,
+            preview_progress,
+            (15, preview_height - 15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            WHITE,
+            2,
+            cv2.LINE_AA,
+        )
+
+        cv2.imshow(
+            "YOLO Vehicle Counter - Phase 10",
+            preview_frame,
+        )
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("Processing stopped by user.")
+
+            print("\nProcessing stopped by user.")
             break
 
-
 finally:
+
     cap.release()
     writer.release()
     cv2.destroyAllWindows()
 
 
-# ================= PHASE 9: EVENT REPORT =================
+# ============================================================
+# 8. EXPORT VEHICLE EVENTS
+# ============================================================
 
 event_columns = [
     "Vehicle_ID",
     "Vehicle_Type",
     "Direction",
     "Frame_Number",
-    "Video_Time",
-    "Timestamp"
+    "Video_Time_Seconds",
+    "Timestamp",
 ]
 
-with open(EVENTS_PATH, "w", newline="", encoding="utf-8") as file:
-    csv_writer = csv.DictWriter(file, fieldnames=event_columns)
+with open(
+    EVENTS_PATH,
+    "w",
+    newline="",
+    encoding="utf-8",
+) as file:
+
+    csv_writer = csv.DictWriter(
+        file,
+        fieldnames=event_columns,
+    )
+
     csv_writer.writeheader()
     csv_writer.writerows(vehicle_events)
 
 
-# ================= PHASE 8: SUMMARY REPORT =================
+# ============================================================
+# 9. EXPORT SUMMARY REPORT
+# ============================================================
 
-all_types = sorted(
-    set(incoming_counts.keys()) |
-    set(outgoing_counts.keys()) |
-    set(VEHICLE_CLASSES.values())
-)
+all_vehicle_types = [
+    "Car",
+    "Motorcycle",
+    "Bus",
+    "Truck",
+]
 
-with open(CSV_PATH, "w", newline="", encoding="utf-8") as file:
+with open(
+    CSV_PATH,
+    "w",
+    newline="",
+    encoding="utf-8",
+) as file:
+
     csv_writer = csv.writer(file)
 
     csv_writer.writerow([
         "Vehicle_Type",
         "Incoming",
         "Outgoing",
-        "Total"
+        "Total",
     ])
 
-    for vehicle_type in all_types:
-        incoming = incoming_counts.get(vehicle_type, 0)
-        outgoing = outgoing_counts.get(vehicle_type, 0)
+    for vehicle_type in all_vehicle_types:
+
+        count_in = incoming_counts.get(
+            vehicle_type,
+            0,
+        )
+
+        count_out = outgoing_counts.get(
+            vehicle_type,
+            0,
+        )
 
         csv_writer.writerow([
             vehicle_type,
-            incoming,
-            outgoing,
-            incoming + outgoing
+            count_in,
+            count_out,
+            count_in + count_out,
         ])
 
     csv_writer.writerow([
         "ALL VEHICLES",
         incoming_total,
         outgoing_total,
-        incoming_total + outgoing_total
+        incoming_total + outgoing_total,
     ])
 
 
-# ================= FINAL RESULTS =================
+# ============================================================
+# 10. FINAL SUMMARY
+# ============================================================
 
-print("\n========== FINAL VEHICLE REPORT ==========")
+print("\n" + "=" * 60)
+print("FINAL VEHICLE REPORT")
+print("=" * 60)
+
 print(f"Incoming vehicles: {incoming_total}")
 print(f"Outgoing vehicles: {outgoing_total}")
-print(f"Total vehicles: {incoming_total + outgoing_total}")
+print(
+    f"Total vehicles: "
+    f"{incoming_total + outgoing_total}"
+)
 
-print("\nIncoming by type:")
-for name in all_types:
-    print(f"{name}: {incoming_counts.get(name, 0)}")
+print("\nVehicle breakdown:")
 
-print("\nOutgoing by type:")
-for name in all_types:
-    print(f"{name}: {outgoing_counts.get(name, 0)}")
+for vehicle_type in all_vehicle_types:
 
-print(f"\nProcessed video: {OUTPUT_PATH}")
-print(f"Summary CSV: {CSV_PATH}")
-print(f"Vehicle events CSV: {EVENTS_PATH}")
-print("Phases 8 and 9 completed!")
+    print(
+        f"{vehicle_type}: "
+        f"IN={incoming_counts.get(vehicle_type, 0)} | "
+        f"OUT={outgoing_counts.get(vehicle_type, 0)}"
+    )
+
+print("\nGenerated files:")
+
+print(f"Processed video: {OUTPUT_PATH}")
+print(f"Summary report: {CSV_PATH}")
+print(f"Events report: {EVENTS_PATH}")
+
+print("\nProcessing completed.")
