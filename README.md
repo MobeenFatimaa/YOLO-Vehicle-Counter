@@ -1,3 +1,4 @@
+![Vehicle Detection and Tracking](assets/vehicle-detection.png)
 # YOLO Vehicle Counter | Intelligent Traffic Analytics
 
 A computer vision project for vehicle detection, multi-object tracking, and directional traffic counting using **YOLO11, ByteTrack, and OpenCV**.
@@ -111,7 +112,7 @@ YOLO-Vehicle-Counter/
 │   └── main.py
 │
 ├── videos/
-│   └── input7.mp4
+│   └── input.mp4
 │
 ├── output/
 │   ├── counted_video.mp4
