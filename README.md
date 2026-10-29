@@ -1,6 +1,6 @@
-![Vehicle Detection and Tracking](assets/vehicle-detection.png)
-# YOLO Vehicle Counter | Intelligent Traffic Analytics
 
+# YOLO Vehicle Counter | Intelligent Traffic Analytics
+![YOLO Vehicle Counter Demo](assets/vehicle-counter-demo.gif)
 A computer vision project for vehicle detection, multi-object tracking, and directional traffic counting using **YOLO11, ByteTrack, and OpenCV**.
 
 The system processes highway footage, tracks vehicles across video frames, distinguishes incoming and outgoing traffic, and generates vehicle statistics and CSV reports.
@@ -13,9 +13,7 @@ The system processes highway footage, tracks vehicles across video frames, disti
 
 <!-- Replace this GIF with your actual demo GIF. -->
 
-![YOLO Vehicle Counter Demo](assets/vehicle-counter-demo.gif)
-
-**Full demonstration:** [Watch the complete demo video](assets/vehicle-counter-demo.mp4)
+**Full demonstration:** [Watch the complete demo video](https://youtu.be/CGzlXJsYTjQ)
 
 The demo showcases vehicle detection, tracking IDs, directional counting, color-coded bounding boxes, and the live analytics dashboard.
 
