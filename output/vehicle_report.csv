@@ -1,0 +1,6 @@
+Vehicle_Type,Incoming,Outgoing,Total
+Car,131,84,215
+Motorcycle,0,0,0
+Bus,3,4,7
+Truck,11,7,18
+ALL VEHICLES,145,95,240
