@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import datetime
 import csv
 import cv2
+import numpy as np
 from ultralytics import YOLO
 
 
@@ -46,6 +47,12 @@ VEHICLE_CLASSES = {
     7: "Truck",
 }
 
+# ------------------------------------------------------------
+# SPEED ESTIMATION CONFIGURATION
+# ------------------------------------------------------------
+# Calibration factor: approximate meters per pixel for overhead highway view
+METERS_PER_PIXEL = 0.05  
+
 # OpenCV uses BGR color order.
 BLUE = (255, 0, 0)
 RED = (0, 0, 255)
@@ -67,7 +74,7 @@ if not VIDEO_PATH.exists():
     )
 
 print("=" * 60)
-print("YOLO VEHICLE COUNTER - HIGHWAY MODE")
+print("YOLO VEHICLE COUNTER & SPEED ESTIMATOR - HIGHWAY MODE")
 print("=" * 60)
 
 print("\nLoading YOLO model...")
@@ -128,34 +135,23 @@ print(f"Road divider X: {split_x}")
 # 4. TRACKING AND COUNTING VARIABLES
 # ============================================================
 
-# Remember the previous side of the counting line for each ID.
-# -1 = above the line
-#  1 = on or below the line
-
 last_line_side = {}
-
-# Remember the frame in which the vehicle was last observed.
 last_seen_frame = {}
-
-# Remember the lane assigned when the vehicle was first seen.
 vehicle_lanes = {}
-
-# Prevent the same tracking ID from being counted repeatedly.
 counted_ids = set()
-
-# Remember the direction assigned to counted vehicles.
 vehicle_directions = {}
 
-# Counts by vehicle type.
+# Speed tracking dictionaries
+previous_positions = {}  # track_id -> (center_x, center_y, frame_number)
+vehicle_speeds = {}      # track_id -> calculated speed in km/h
+
 incoming_counts = defaultdict(int)
 outgoing_counts = defaultdict(int)
 
 incoming_total = 0
 outgoing_total = 0
 
-# Event report.
 vehicle_events = []
-
 frame_number = 0
 
 
@@ -291,7 +287,6 @@ def record_vehicle(
 ):
     global incoming_total, outgoing_total
 
-    # This function should only be called for uncounted IDs.
     if track_id in counted_ids:
         return
 
@@ -337,7 +332,7 @@ def record_vehicle(
 # 7. MAIN PROCESSING LOOP
 # ============================================================
 
-print("\nStarting video processing...")
+print("\nStarting video processing with speed estimation...")
 print("LEFT ROAD: Incoming vehicles (BLUE)")
 print("RIGHT ROAD: Outgoing vehicles (RED)")
 print("DIVIDER AREA: Yellow")
@@ -375,7 +370,6 @@ try:
         # DRAW COUNTING LINE AND ROAD DIVIDER
         # ----------------------------------------------------
 
-        # Left half of the horizontal counting line.
         cv2.line(
             frame,
             (0, line_y),
@@ -384,7 +378,6 @@ try:
             3,
         )
 
-        # Right half of the horizontal counting line.
         cv2.line(
             frame,
             (split_x, line_y),
@@ -393,7 +386,6 @@ try:
             3,
         )
 
-        # Vertical divider between the traffic directions.
         cv2.line(
             frame,
             (split_x, 0),
@@ -403,8 +395,10 @@ try:
         )
 
         # ----------------------------------------------------
-        # PROCESS TRACKED VEHICLES
+        # PROCESS TRACKED VEHICLES & SPEED ESTIMATION
         # ----------------------------------------------------
+
+        active_track_ids = set()
 
         if (
             results
@@ -441,6 +435,7 @@ try:
                 track_ids,
             ):
 
+                active_track_ids.add(track_id)
                 x1, y1, x2, y2 = map(int, box)
 
                 vehicle_name = VEHICLE_CLASSES.get(
@@ -452,12 +447,36 @@ try:
                 bottom_y = y2
 
                 # ------------------------------------------------
+                # SPEED ESTIMATION LOGIC
+                # ------------------------------------------------
+                if track_id in previous_positions:
+                    prev_x, prev_y, prev_frame = previous_positions[track_id]
+                    frame_diff = frame_number - prev_frame
+                    
+                    if frame_diff > 0:
+                        # Euclidean distance in pixels
+                        pixel_distance = np.sqrt((center_x - prev_x)**2 + (bottom_y - prev_y)**2)
+                        # Distance in real-world meters
+                        meter_distance = pixel_distance * METERS_PER_PIXEL
+                        # Time elapsed in seconds
+                        time_elapsed = frame_diff / fps
+                        
+                        if time_elapsed > 0:
+                            speed_mps = meter_distance / time_elapsed
+                            speed_kmh = speed_mps * 3.6  # convert meters per second to km/h
+                            
+                            # Smooth speed fluctuations
+                            if track_id in vehicle_speeds:
+                                vehicle_speeds[track_id] = int(0.7 * vehicle_speeds[track_id] + 0.3 * speed_kmh)
+                            else:
+                                vehicle_speeds[track_id] = int(speed_kmh)
+
+                previous_positions[track_id] = (center_x, bottom_y, frame_number)
+                vehicle_speed = vehicle_speeds.get(track_id, 0)
+
+                # ------------------------------------------------
                 # IDENTIFY THE VEHICLE'S LANE
                 # ------------------------------------------------
-
-                # Keep the initial lane assignment for this ID.
-                # Do not let small bounding-box movements around
-                # the divider repeatedly change the lane.
 
                 if track_id not in vehicle_lanes:
 
@@ -508,14 +527,12 @@ try:
 
                         event_direction = None
 
-                        # Downward crossing = incoming.
                         if (
                             previous_side == -1
                             and current_side == 1
                         ):
                             event_direction = "INCOMING"
 
-                        # Upward crossing = outgoing.
                         elif (
                             previous_side == 1
                             and current_side == -1
@@ -531,18 +548,15 @@ try:
                                 frame_number=frame_number,
                             )
 
-                # Update the previous observation after checking
-                # whether a crossing occurred.
                 last_line_side[track_id] = current_side
                 last_seen_frame[track_id] = frame_number
 
                 # ------------------------------------------------
-                # ASSIGN BOX COLOR
+                # ASSIGN BOX COLOR & SPEED LABEL
                 # ------------------------------------------------
 
                 if track_id in counted_ids:
 
-                    # Counted vehicles retain their counted color.
                     direction = vehicle_directions[track_id]
 
                     if direction == "INCOMING":
@@ -552,13 +566,11 @@ try:
 
                     label = (
                         f"{vehicle_name} ID:{track_id} "
-                        f"{direction}"
+                        f"{direction} | {vehicle_speed} km/h"
                     )
 
                 else:
 
-                    # Color vehicles immediately using the road.
-                    # This does not wait for the counting line.
                     divider_margin = int(
                         width * DIVIDER_MARGIN
                     )
@@ -568,7 +580,7 @@ try:
                         color = YELLOW
                         label = (
                             f"{vehicle_name} ID:{track_id} "
-                            "TRACKING"
+                            f"TRACKING | {vehicle_speed} km/h"
                         )
 
                     elif lane == "LEFT":
@@ -577,7 +589,7 @@ try:
 
                         label = (
                             f"{vehicle_name} ID:{track_id} "
-                            "OUTGOING"
+                            f"OUTGOING | {vehicle_speed} km/h"
                         )
 
                     else:
@@ -586,7 +598,7 @@ try:
 
                         label = (
                             f"{vehicle_name} ID:{track_id} "
-                            "INCOMING"
+                            f"INCOMING | {vehicle_speed} km/h"
                         )
 
                 # ------------------------------------------------
@@ -608,11 +620,16 @@ try:
                     label,
                     (x1, text_y),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
+                    0.50,
                     color,
                     2,
                     cv2.LINE_AA,
                 )
+
+        # Clean up old tracked positions for memory optimization
+        for tid in list(previous_positions.keys()):
+            if tid not in active_track_ids and frame_number - previous_positions[tid][2] > 60:
+                del previous_positions[tid]
 
         # ----------------------------------------------------
         # DRAW PROGRESS
@@ -701,7 +718,7 @@ try:
         )
 
         cv2.imshow(
-            "YOLO Vehicle Counter - Phase 10",
+            "YOLO Vehicle Counter & Speed Estimator",
             preview_frame,
         )
 
